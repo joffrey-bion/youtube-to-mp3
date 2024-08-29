@@ -27,8 +27,9 @@ private val http = HttpClient {
     }
 }
 
-fun main(args: Array<String>) = runBlocking {
-    val downloadDir = Path("./downloaded-mp3s").createDirectories()
+@OptIn(ExperimentalCoroutinesApi::class)
+fun main(args: Array<String>) = runBlocking(Dispatchers.IO.limitedParallelism(5)) {
+    val downloadDir = Path("./downloads").createDirectories()
 
     if (args.isEmpty()) {
         println("Please provide the list of video URLs as arguments")
@@ -36,11 +37,27 @@ fun main(args: Array<String>) = runBlocking {
     }
 
     println("Downloading mp3 audio for ${args.size} videos...")
+    convertToMp3AndDownload(args.toList()) { index, _, title ->
+        val regex = Regex("""[^a-zA-Z0-9_\-.éàèëïùö\s()\[\]]""")
+        val sanitizedTitle = title.replace(regex, "_")
+        downloadDir.resolve("${index + 1} - $sanitizedTitle.mp3")
+    }
+}
+
+private suspend fun convertToMp3AndDownload(
+    youtubeVideoUrls: List<String>,
+    getPath: (index: Int, videoId: String, title: String) -> Path
+) = coroutineScope {
     http.get("https://ytmp3s.nu/6ufl/")
-    args.forEach { videoUrl ->
+
+    youtubeVideoUrls.forEachIndexed { i, videoUrl ->
         launch {
             val videoId = youtubeVideoId(videoUrl)
-            http.convertToMp3(videoId = videoId, path = downloadDir.resolve("$videoId.mp3"))
+            try {
+                http.convertToMp3(videoId = videoId, getPath = { title -> getPath(i, videoId, title) })
+            } catch (e: Exception) {
+                System.err.println("Conversion failed for $videoId: $e${e.cause?.let { "\n   (Caused by: $it)" }}")
+            }
         }
     }
 }
@@ -68,7 +85,7 @@ data class ProgressResponse(
     val title: String,
 )
 
-private suspend fun HttpClient.convertToMp3(videoId: String, path: Path) {
+private suspend fun HttpClient.convertToMp3(videoId: String, getPath: (title: String) -> Path) {
     println("Initializing conversion for $videoId...")
     val initResponse = get("https://nu.ummn.nu/api/v1/init?p=y&23=1llum1n471&_=${Random.nextFloat()}") {
         header(HttpHeaders.Referrer, "https://ytmp3s.nu/")
@@ -78,10 +95,10 @@ private suspend fun HttpClient.convertToMp3(videoId: String, path: Path) {
     val convertResponse = startConversion(initResponse.convertURL, videoId)
 
     println("Tracking progress for $videoId...")
-    awaitConversion(convertResponse.progressURL)
+    val progressResponse = awaitConversion(convertResponse.progressURL)
 
     println("Downloading mp3 file for $videoId...")
-    downloadMp3(convertResponse.downloadURL, videoId, path)
+    downloadMp3(convertResponse.downloadURL, videoId, getPath(progressResponse.title))
 }
 
 private suspend fun HttpClient.startConversion(baseUrl: String, videoId: String): ConvertResponse {
