@@ -1,62 +1,56 @@
 import io.ktor.client.*
-import io.ktor.client.call.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.cookies.*
-import io.ktor.client.request.*
-import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.*
 import io.ktor.serialization.kotlinx.json.*
-import io.ktor.utils.io.jvm.javaio.*
 import kotlinx.coroutines.*
-import kotlinx.serialization.*
 import java.nio.file.*
 import kotlin.io.path.*
-import kotlin.random.*
+import kotlin.math.*
 import kotlin.system.*
 import kotlin.time.*
 import kotlin.time.Duration.Companion.milliseconds
 
-private val http = HttpClient {
-    expectSuccess = true
-
-    install(HttpCookies)
-    install(ContentNegotiation) {
-        json()
-        serialization(ContentType.Text.Plain, DefaultJson)
-    }
-}
-
 @OptIn(ExperimentalCoroutinesApi::class)
 fun main(args: Array<String>) = runBlocking(Dispatchers.IO.limitedParallelism(5)) {
-    val downloadDir = Path("./downloads").createDirectories()
-
     if (args.isEmpty()) {
-        println("Please provide the list of video URLs as arguments")
+        println("Missing argument: provide the path to a file with video URLs")
         exitProcess(0)
     }
 
-    println("Downloading mp3 audio for ${args.size} videos...")
-    convertToMp3AndDownload(args.toList()) { index, _, title ->
+    val urlsFile = Path(args[0]).absolute()
+    val urls = urlsFile.readLines().filterNot { it.isBlank() }
+    val downloadDir = urlsFile.parent.resolve(urlsFile.nameWithoutExtension).createDirectories()
+
+    val http = HttpClient {
+        expectSuccess = true
+        install(HttpCookies)
+        install(ContentNegotiation) {
+            json()
+            serialization(ContentType.Text.Plain, DefaultJson)
+        }
+    }
+
+    println("Downloading mp3 audio for ${urls.size} videos to $downloadDir...")
+    Ytmp3Client(http).convertToMp3AndDownload(urls) { index, _, title ->
         val regex = Regex("""[^a-zA-Z0-9_\-.éàèëïùö\s()\[\]]""")
         val sanitizedTitle = title.replace(regex, "_")
         downloadDir.resolve("${index + 1} - $sanitizedTitle.mp3")
     }
 }
 
-private suspend fun convertToMp3AndDownload(
+private suspend fun Ytmp3Client.convertToMp3AndDownload(
     youtubeVideoUrls: List<String>,
-    getPath: (index: Int, videoId: String, title: String) -> Path
+    getPath: (index: Int, videoId: String, title: String) -> Path,
 ) = coroutineScope {
-    http.get("https://ytmp3s.nu/6ufl/")
-
     youtubeVideoUrls.forEachIndexed { i, videoUrl ->
         launch {
             val videoId = youtubeVideoId(videoUrl)
             try {
-                http.convertToMp3(videoId = videoId, getPath = { title -> getPath(i, videoId, title) })
+                convertToMp3(videoId = videoId, getPath = { title -> getPath(i, videoId, title) })
             } catch (e: Exception) {
-                System.err.println("Conversion failed for $videoId: $e${e.cause?.let { "\n   (Caused by: $it)" }}")
+                System.err.println("Conversion failed for $videoId: $e${e.cause?.let { "\n   (Caused by: $it)" } ?: ""}")
             }
         }
     }
@@ -66,94 +60,43 @@ private suspend fun convertToMp3AndDownload(
 private fun youtubeVideoId(url: String): String =
     Url(url).parameters["v"] ?: error("Missing 'v' query parameter in $url")
 
-@Serializable
-data class InitResponse(val convertURL: String, val error: Int)
-
-@Serializable
-data class ConvertResponse(
-    val downloadURL: String,
-    val progressURL: String,
-    val error: Int,
-    val redirect: Int = 0,
-    val redirectURL: String = "",
-)
-
-@Serializable
-data class ProgressResponse(
-    val progress: Int,
-    val error: Int,
-    val title: String,
-)
-
-private suspend fun HttpClient.convertToMp3(videoId: String, getPath: (title: String) -> Path) {
+private suspend fun Ytmp3Client.convertToMp3(videoId: String, getPath: (title: String) -> Path) {
     println("Initializing conversion for $videoId...")
-    val initResponse = get("https://nu.ummn.nu/api/v1/init?p=y&23=1llum1n471&_=${Random.nextFloat()}") {
-        header(HttpHeaders.Referrer, "https://ytmp3s.nu/")
-    }.body<InitResponse>()
+    val initResponse = init()
 
     println("Starting conversion for $videoId...")
     val convertResponse = startConversion(initResponse.convertURL, videoId)
 
     println("Tracking progress for $videoId...")
-    val progressResponse = awaitConversion(convertResponse.progressURL)
+    val progressResponse = awaitConversion(progressUrl = convertResponse.progressURL)
 
     println("Downloading mp3 file for $videoId...")
-    downloadMp3(convertResponse.downloadURL, videoId, getPath(progressResponse.title))
+    download(convertResponse.downloadURL, videoId, getPath(progressResponse.title)) { bytes, total ->
+        if (total != null) {
+            val progressPercent = round(bytes.toDouble() / total * 100)
+            println("Downloading mp3 file for $videoId... $progressPercent%")
+        }
+    }
 }
 
-private suspend fun HttpClient.startConversion(baseUrl: String, videoId: String): ConvertResponse {
-    var response = startConversionOnce(baseUrl, videoId)
+private suspend fun Ytmp3Client.startConversion(convertUrl: String, videoId: String): ConvertResponse {
+    var response = convert(convertUrl = convertUrl, videoId = videoId)
     while (response.redirect > 0) {
-        println("Conversion redirected to ${response.redirectURL}")
-        response = startConversionOnce(response.redirectURL, videoId)
+        response = convert(convertUrl = response.redirectURL, videoId = videoId)
     }
     return response
 }
 
-private suspend fun HttpClient.startConversionOnce(baseUrl: String, videoId: String): ConvertResponse {
-    val convertUrl = buildUrl(baseUrl) {
-        parameters["v"] = "https://www.youtube.com/watch?v=$videoId"
-        parameters["f"] = "mp3"
-        parameters["_"] = Random.nextFloat().toString()
-    }
-    return get(convertUrl) { header(HttpHeaders.Referrer, "https://ytmp3s.nu/") }.body<ConvertResponse>()
-}
-
-private suspend fun HttpClient.awaitConversion(
+private suspend fun Ytmp3Client.awaitConversion(
     progressUrl: String,
     pollingPeriod: Duration = 500.milliseconds,
 ): ProgressResponse {
     while (true) {
-        val effectiveProgressUrl = buildUrl(progressUrl) {
-            parameters["_"] = Random.nextFloat().toString()
-        }
-        val progressResponse = get(effectiveProgressUrl).body<ProgressResponse>()
-        println("  conversion in progress... (${progressResponse.progress}/3)")
-        if (progressResponse.progress >= 3) {
+        val progressResponse = progress(progressUrl)
+        println("  conversion in progress... (${progressResponse.progress}/${ProgressResponse.MaxProgress})")
+        if (progressResponse.isComplete) {
             return progressResponse
         }
         delay(pollingPeriod)
-    }
-}
-
-private suspend fun HttpClient.downloadMp3(
-    baseDownloadUrl: String,
-    videoId: String,
-    path: Path,
-) {
-    val downloadUrl = buildUrl(baseDownloadUrl) {
-        parameters["v"] = "v=$videoId, $videoId"
-        parameters["_"] = Random.nextFloat().toString()
-    }
-    downloadFile(downloadUrl, path)
-}
-
-private fun buildUrl(baseUrl: String, block: URLBuilder.() -> Unit): Url = URLBuilder(baseUrl).apply(block).build()
-
-private suspend fun HttpClient.downloadFile(downloadUrl: Url, path: Path) {
-    prepareGet(downloadUrl).execute { response ->
-        path.outputStream().use {
-            response.bodyAsChannel().copyTo(it)
-        }
     }
 }
