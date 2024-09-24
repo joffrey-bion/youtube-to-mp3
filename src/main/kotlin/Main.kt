@@ -12,8 +12,7 @@ import kotlin.system.*
 import kotlin.time.*
 import kotlin.time.Duration.Companion.milliseconds
 
-@OptIn(ExperimentalCoroutinesApi::class)
-fun main(args: Array<String>) = runBlocking(Dispatchers.IO.limitedParallelism(5)) {
+suspend fun main(args: Array<String>) = withContext(Dispatchers.IO.limitedParallelism(5)) {
     if (args.isEmpty()) {
         println("Missing argument: provide the path to a file with video URLs")
         exitProcess(0)
